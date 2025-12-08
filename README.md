@@ -1,6 +1,6 @@
-# estanbulgaming Organization GitHub Configuration
+# estanbulgaming GitHub Configuration
 
-This repository contains organization-wide GitHub configurations and reusable workflows.
+Organization-wide GitHub configurations and reusable workflows.
 
 ## Reusable Workflows
 
@@ -8,7 +8,7 @@ This repository contains organization-wide GitHub configurations and reusable wo
 
 Automated security analysis using Gemini AI. Reviews code changes in PRs and posts findings as comments.
 
-**Usage:**
+**Usage (with path filters - recommended):**
 
 ```yaml
 name: AI Security Review
@@ -16,6 +16,24 @@ name: AI Security Review
 on:
   pull_request:
     types: [opened, synchronize]
+    paths:
+      - '**.py'
+      - '**.js'
+      - '**.ts'
+      - '**.jsx'
+      - '**.tsx'
+      - '**.go'
+      - '**.rs'
+      - '**.java'
+      - '**.cs'
+      - '**.php'
+      - '**.rb'
+      - '**.sql'
+      - '**.sh'
+      - '**.yml'
+      - '**.yaml'
+      - 'Dockerfile'
+      - '**.env.example'
 
 jobs:
   security:
@@ -38,10 +56,38 @@ jobs:
 ```
 
 **Required secrets:**
-- `GEMINI_API_KEY_CI` - Google Gemini API key
+
+- `GEMINI_API_KEY_CI` - Google Gemini API key (set as organization secret)
 
 **Optional file:**
+
 - `.github/SECURITY_RULES.md` - Custom security rules for your project
+
+## Path Filters
+
+Using path filters saves API costs by only running security review when relevant code files change. The recommended filters above cover:
+
+| Extension | Language/File |
+|-----------|---------------|
+| `.py` | Python |
+| `.js`, `.ts`, `.jsx`, `.tsx` | JavaScript/TypeScript |
+| `.go` | Go |
+| `.rs` | Rust |
+| `.java` | Java |
+| `.cs` | C# |
+| `.php` | PHP |
+| `.rb` | Ruby |
+| `.sql` | SQL |
+| `.sh` | Shell scripts |
+| `.yml`, `.yaml` | Config files (CI, Docker Compose) |
+| `Dockerfile` | Docker |
+| `.env.example` | Environment templates |
+
+**Excluded (no security review):**
+- Markdown files (`.md`)
+- Images (`.png`, `.jpg`, `.svg`)
+- Lock files (`package-lock.json`, etc.)
+- Pure data files (`.json`, `.csv`)
 
 ## Custom Security Rules
 
@@ -59,14 +105,14 @@ Each repository can define its own security rules by creating `.github/SECURITY_
 
 ## Allowed Patterns (Ignore)
 - CORS "*" is intentional for development environment
-- SQLite is acceptable for this project (not production-scale)
+- SQLite is acceptable for this project
 ```
 
 ## Severity Levels
 
-| Level | Emoji | Action |
-|-------|-------|--------|
-| CRITICAL | 🔴 | Blocks merge (if `fail_on_critical: true`) |
-| HIGH | 🟠 | Warning or blocks (if `fail_on_high: true`) |
-| MEDIUM | 🟡 | Warning |
-| LOW | 🔵 | Info |
+| Level | Action |
+|-------|--------|
+| CRITICAL | Blocks merge (if `fail_on_critical: true`) |
+| HIGH | Warning or blocks (if `fail_on_high: true`) |
+| MEDIUM | Warning |
+| LOW | Info |

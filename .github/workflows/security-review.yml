@@ -1,0 +1,277 @@
+name: AI Security Review
+
+on:
+  workflow_call:
+    inputs:
+      fail_on_critical:
+        description: 'Fail the workflow if CRITICAL issues are found'
+        type: boolean
+        default: true
+      fail_on_high:
+        description: 'Fail the workflow if HIGH issues are found'
+        type: boolean
+        default: false
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+jobs:
+  security-review:
+    name: AI Security Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install google-genai
+
+      - name: Get changed files
+        id: changed
+        run: |
+          BASE_REF="${{ github.base_ref }}"
+          if [ -z "$BASE_REF" ]; then
+            BASE_REF="main"
+          fi
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          git diff --name-only origin/${BASE_REF}...HEAD >> $GITHUB_OUTPUT || echo "Unable to get diff" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Get diff content
+        id: diff
+        run: |
+          BASE_REF="${{ github.base_ref }}"
+          if [ -z "$BASE_REF" ]; then
+            BASE_REF="main"
+          fi
+          # Write diff to file to avoid argument list too long error
+          git diff origin/${BASE_REF}...HEAD > diff_content.txt 2>&1 || echo "Unable to get diff" > diff_content.txt
+
+      - name: Run AI Security Review
+        id: review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CHANGED_FILES: ${{ steps.changed.outputs.files }}
+        run: |
+          python << 'SCRIPT'
+          import os
+          import json
+          from google import genai
+
+          api_key = os.environ.get("GEMINI_API_KEY")
+          changed_files = os.environ.get("CHANGED_FILES", "")
+
+          # Read diff from file instead of environment variable
+          diff_content = ""
+          if os.path.exists("diff_content.txt"):
+              with open("diff_content.txt", "r") as f:
+                  diff_content = f.read()
+
+          # Truncate very large diffs to avoid token limits
+          MAX_DIFF_SIZE = 100000  # ~100KB
+          if len(diff_content) > MAX_DIFF_SIZE:
+              diff_content = diff_content[:MAX_DIFF_SIZE] + "\n\n[... DIFF TRUNCATED - Too large for full analysis ...]"
+
+          if not diff_content.strip():
+              print("No code changes to review")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("result=NO_CHANGES\n")
+              exit(0)
+
+          # Read security rules if exists
+          rules = ""
+          rules_path = ".github/SECURITY_RULES.md"
+          if os.path.exists(rules_path):
+              with open(rules_path) as f:
+                  rules = f.read()
+
+          client = genai.Client(api_key=api_key)
+
+          prompt = f"""You are a security expert. Analyze the following code changes for security vulnerabilities.
+
+          ## Security Rules
+          {rules}
+
+          ## Changed Files
+          {changed_files}
+
+          ## Code Changes (Diff)
+          ```diff
+          {diff_content}
+          ```
+
+          ## Analysis Instructions
+
+          For each finding, respond in this format:
+
+          ### [SEVERITY] Title
+          - **File:** filename:line_number
+          - **Issue:** Brief description of the issue
+          - **Risk:** How this vulnerability could be exploited
+          - **Recommendation:** How to fix it
+          - **Code Example:** (if applicable, show fixed code)
+
+          Severity levels:
+          - 🔴 **CRITICAL**: Immediate action required (injection, auth bypass, credential leak)
+          - 🟠 **HIGH**: Significant security risk (missing validation, CORS issues)
+          - 🟡 **MEDIUM**: Moderate risk (verbose errors, weak crypto)
+          - 🔵 **LOW**: Low risk, improvement suggestion (code quality, best practices)
+
+          If no security issues are found:
+          ✅ **Security scan completed - No issues found**
+
+          Only report real security issues. Avoid false positives.
+          DO NOT make code quality or style suggestions, focus only on security.
+          """
+
+          import time
+
+          MAX_RETRIES = 1
+          RETRY_DELAY = 35  # seconds
+          result = None
+
+          try:
+              for attempt in range(MAX_RETRIES):
+                  try:
+                      response = client.models.generate_content(
+                          model="gemini-2.5-flash",
+                          contents=prompt
+                      )
+                      result = response.text
+                      print(result)
+                      break
+                  except Exception as e:
+                      error_str = str(e)
+                      if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                          if attempt < MAX_RETRIES - 1:
+                              print(f"Rate limit hit, waiting {RETRY_DELAY}s before retry {attempt + 2}/{MAX_RETRIES}...")
+                              time.sleep(RETRY_DELAY)
+                              continue
+                      raise
+              else:
+                  raise Exception("Rate limit exceeded after retries")
+
+              # Save result for PR comment
+              with open("security_review.md", "w") as f:
+                  f.write("## 🔒 AI Security Review\n\n")
+                  f.write(result)
+                  f.write("\n\n---\n*Automated security review powered by Gemini AI*")
+
+              # Check for critical/high severity issues
+              has_critical = "CRITICAL" in result or "🔴" in result
+              has_high = "HIGH" in result or "🟠" in result
+
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("result=COMPLETED\n")
+                  f.write(f"has_critical={str(has_critical).lower()}\n")
+                  f.write(f"has_high={str(has_high).lower()}\n")
+
+          except Exception as e:
+              error_str = str(e)
+              print(f"Error: {e}")
+
+              # Check if this is a quota exhaustion error (not just temporary rate limit)
+              if "limit: 0" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                  # Quota exhausted - create warning comment and exit gracefully
+                  with open("security_review.md", "w") as f:
+                      f.write("## ⚠️ AI Security Review - Quota Exceeded\n\n")
+                      f.write("The AI security review could not be completed because the Gemini API quota has been exhausted.\n\n")
+                      f.write("**This is not a security issue** - the automated review will run again on the next commit or when the quota resets.\n\n")
+                      f.write("---\n*Automated security review powered by Gemini AI*")
+
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                      f.write("result=QUOTA_EXHAUSTED\n")
+                      f.write("has_critical=false\n")
+                      f.write("has_high=false\n")
+              else:
+                  with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                      f.write("result=ERROR\n")
+                  exit(1)
+          SCRIPT
+
+      - name: Post PR Comment
+        if: steps.review.outputs.result == 'COMPLETED' || steps.review.outputs.result == 'QUOTA_EXHAUSTED'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const review = fs.readFileSync('security_review.md', 'utf8');
+
+            // Get PR number - either from context (pull_request trigger) or find from branch (workflow_dispatch)
+            let prNumber = context.issue?.number;
+
+            if (!prNumber) {
+              // For workflow_dispatch, find PR by head ref
+              const branch = context.ref.replace('refs/heads/', '');
+              const { data: prs } = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                head: `${context.repo.owner}:${branch}`,
+                state: 'open'
+              });
+
+              if (prs.length > 0) {
+                prNumber = prs[0].number;
+              } else {
+                console.log('No open PR found for branch:', branch);
+                return;
+              }
+            }
+
+            // Find existing bot comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' &&
+              c.body.includes('AI Security Review')
+            );
+
+            if (botComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: review
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: review
+              });
+            }
+
+      - name: Fail on Critical Issues
+        if: inputs.fail_on_critical && steps.review.outputs.has_critical == 'true'
+        run: |
+          echo "::error::CRITICAL security issues found! Review must be addressed before merging."
+          exit 1
+
+      - name: Fail on High Issues
+        if: inputs.fail_on_high && steps.review.outputs.has_high == 'true'
+        run: |
+          echo "::error::HIGH severity security issues found! Review must be addressed before merging."
+          exit 1
+
+      - name: Warn on High Issues
+        if: steps.review.outputs.has_high == 'true' && !inputs.fail_on_high
+        run: |
+          echo "::warning::HIGH severity security issues found. Please review the comments."

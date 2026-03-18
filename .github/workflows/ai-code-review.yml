@@ -1,0 +1,468 @@
+name: AI Code Review
+
+on:
+  workflow_call:
+    inputs:
+      fail_on_critical:
+        description: 'Fail the workflow if CRITICAL issues are found'
+        type: boolean
+        default: true
+      fail_on_high:
+        description: 'Fail the workflow if HIGH issues are found'
+        type: boolean
+        default: false
+      review_scope:
+        description: 'Review passes to run: security, quality, architecture, or all'
+        type: string
+        default: 'all'
+      model:
+        description: 'Gemini model ID'
+        type: string
+        default: 'gemini-3.1-flash-lite-preview'
+      thinking_level:
+        description: 'Thinking depth: minimal, low, medium, high'
+        type: string
+        default: 'medium'
+      runs_on:
+        description: 'Runner label (ubuntu-latest, self-hosted, etc.)'
+        type: string
+        default: 'ubuntu-latest'
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+jobs:
+  ai-review:
+    name: AI Code Review
+    runs-on: ${{ inputs.runs_on }}
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -q google-genai
+
+      - name: Gather context
+        id: context
+        run: |
+          BASE_REF="${{ github.base_ref }}"
+          if [ -z "$BASE_REF" ]; then BASE_REF="main"; fi
+
+          # Changed file list
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          git diff --name-only origin/${BASE_REF}...HEAD >> $GITHUB_OUTPUT 2>/dev/null || echo "Unable to get diff" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Full diff
+          git diff origin/${BASE_REF}...HEAD > diff_content.txt 2>&1 || echo "Unable to get diff" > diff_content.txt
+
+          # File tree (for architecture pass)
+          git ls-files > file_tree.txt 2>/dev/null || true
+
+      - name: Run AI Code Review
+        id: review
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CHANGED_FILES: ${{ steps.context.outputs.files }}
+          REVIEW_SCOPE: ${{ inputs.review_scope }}
+          MODEL: ${{ inputs.model }}
+          THINKING_LEVEL: ${{ inputs.thinking_level }}
+        run: |
+          python3 << 'PYEOF'
+          import os, re, time, sys
+          from google import genai
+          from google.genai import types
+
+          # ── Config ──────────────────────────────────────────────────
+          API_KEY = os.environ["GEMINI_API_KEY"]
+          CHANGED_FILES = os.environ.get("CHANGED_FILES", "")
+          REVIEW_SCOPE = os.environ.get("REVIEW_SCOPE", "all")
+          MODEL = os.environ.get("MODEL", "gemini-3.1-flash-lite-preview")
+          THINKING_LEVEL = os.environ.get("THINKING_LEVEL", "medium")
+          MAX_DIFF_SIZE = 200_000
+          MAX_RETRIES = 2
+          RETRY_DELAYS = [30, 60]
+
+          SECRET_PATTERNS = [
+              (r'(?i)(api[_-]?key|apikey|secret|password|passwd|token|credential|auth)["\']?\s*[:=]\s*["\']?[A-Za-z0-9_\-]{8,}', '[MASKED_SECRET]'),
+              (r'(?i)(bearer|basic)\s+[A-Za-z0-9_\-\.]+', '[MASKED_AUTH]'),
+              (r'ghp_[A-Za-z0-9]{36}', '[MASKED_GH_TOKEN]'),
+              (r'gho_[A-Za-z0-9]{36}', '[MASKED_GH_TOKEN]'),
+              (r'github_pat_[A-Za-z0-9_]{22,}', '[MASKED_GH_TOKEN]'),
+              (r'sk-[A-Za-z0-9]{32,}', '[MASKED_OPENAI_KEY]'),
+              (r'AIza[A-Za-z0-9_\-]{35}', '[MASKED_GOOGLE_KEY]'),
+              (r'xox[baprs]-[A-Za-z0-9\-]+', '[MASKED_SLACK_TOKEN]'),
+              (r'AKIA[A-Z0-9]{16}', '[MASKED_AWS_KEY]'),
+          ]
+
+          # ── Helpers ─────────────────────────────────────────────────
+          def read_file(path, max_size=None):
+              if not os.path.exists(path):
+                  return ""
+              with open(path, "r", errors="replace") as f:
+                  content = f.read()
+              if max_size and len(content) > max_size:
+                  content = content[:max_size] + "\n\n[... TRUNCATED ...]"
+              return content
+
+          def mask_secrets(text):
+              for pattern, replacement in SECRET_PATTERNS:
+                  text = re.sub(pattern, replacement, text)
+              return text
+
+          def write_output(key, value):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"{key}={value}\n")
+
+          def call_gemini(client, prompt):
+              for attempt in range(MAX_RETRIES):
+                  try:
+                      response = client.models.generate_content(
+                          model=MODEL,
+                          contents=prompt,
+                          config=types.GenerateContentConfig(
+                              thinking_config=types.ThinkingConfig(
+                                  thinking_level=THINKING_LEVEL
+                              )
+                          ),
+                      )
+                      return response.text
+                  except Exception as e:
+                      err = str(e)
+                      if ("429" in err or "RESOURCE_EXHAUSTED" in err) and attempt < MAX_RETRIES - 1:
+                          delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+                          print(f"  Rate limit hit, retrying in {delay}s ({attempt + 1}/{MAX_RETRIES})...")
+                          time.sleep(delay)
+                          continue
+                      raise
+
+          def count_severity(text):
+              return {
+                  "🔴": text.count("🔴"),
+                  "🟠": text.count("🟠"),
+                  "🟡": text.count("🟡"),
+                  "🔵": text.count("🔵"),
+              }
+
+          # ── Prompts ────────────────────────────────────────────────
+          def security_prompt(diff, files, rules):
+              return f"""You are a senior security engineer performing a security audit.
+
+          ## Custom Security Rules
+          {rules if rules else "No custom rules defined."}
+
+          ## Changed Files
+          {files}
+
+          ## Code Changes
+          ```diff
+          {diff}
+          ```
+
+          ## Instructions
+          Report each finding as:
+
+          ### [EMOJI] [SEVERITY]: Title
+          - **File:** path:line_number
+          - **Issue:** What is wrong
+          - **Risk:** How this could be exploited
+          - **Fix:** How to fix it
+
+          Severity:
+          - 🔴 CRITICAL: Injection, auth bypass, credential leak, RCE
+          - 🟠 HIGH: Missing input validation, CORS/CSRF, SSRF, path traversal
+          - 🟡 MEDIUM: Verbose errors, weak crypto, missing rate limits, insecure defaults
+          - 🔵 LOW: Minor hardening opportunities
+
+          If no issues found: ✅ No security issues found
+
+          RULES:
+          - ONLY security issues. NOT code quality, style, or naming.
+          - Be precise with file paths and line numbers from the diff.
+          - HIGH CONFIDENCE ONLY — when in doubt, do not report.
+          - Test files (*.test.*, __tests__/*) with mock secrets are NOT issues.
+          - Config objects reading from env vars (settings.*, process.env.*) are NOT hardcoded secrets.
+          - [MASKED_SECRET] and [MASKED_*] are CI masking patterns, NOT real credential leaks.
+          """
+
+          def quality_prompt(diff, files, context):
+              return f"""You are a senior software engineer reviewing code for substantive quality issues.
+
+          ## Project Context
+          {context if context else "No project context available."}
+
+          ## Changed Files
+          {files}
+
+          ## Code Changes
+          ```diff
+          {diff}
+          ```
+
+          ## Instructions
+          Report each finding as:
+
+          ### [EMOJI] [SEVERITY]: Title
+          - **File:** path:line_number
+          - **Issue:** What is wrong
+          - **Impact:** What could go wrong at runtime
+          - **Fix:** How to fix it
+
+          Severity:
+          - 🔴 CRITICAL: Data loss, infinite loop, crash in production, memory leak
+          - 🟠 HIGH: Unhandled errors, race conditions, resource leaks, null dereference
+          - 🟡 MEDIUM: Missing edge cases, inefficient hot-path algorithms, poor error messages
+          - 🔵 LOW: Minor improvements with clear runtime benefit
+
+          If no issues found: ✅ No quality issues found
+
+          RULES:
+          - Do NOT report style, formatting, naming, or missing comments — linters handle those.
+          - Do NOT suggest adding type annotations, docstrings, or documentation.
+          - Focus on BUGS, logic errors, and potential runtime failures.
+          - Consider edge cases the author may have missed.
+          - HIGH CONFIDENCE ONLY — if you're not sure it's a bug, don't report it.
+          """
+
+          def architecture_prompt(diff, files, context, file_tree):
+              return f"""You are a software architect reviewing code changes for structural impact.
+
+          ## Project Context
+          {context if context else "No project context available."}
+
+          ## Repository File Structure
+          ```
+          {file_tree}
+          ```
+
+          ## Changed Files
+          {files}
+
+          ## Code Changes
+          ```diff
+          {diff}
+          ```
+
+          ## Instructions
+          Report each finding as:
+
+          ### [EMOJI] [SEVERITY]: Title
+          - **File:** path:line_number
+          - **Issue:** What is structurally wrong
+          - **Impact:** How this affects the codebase long-term
+          - **Fix:** How to address it
+
+          Severity:
+          - 🔴 CRITICAL: Breaking public API contract, data migration required, security architecture flaw
+          - 🟠 HIGH: Tight coupling across boundaries, wrong dependency direction, layer violation
+          - 🟡 MEDIUM: Inconsistent patterns, missing abstraction boundary, DDD violation
+          - 🔵 LOW: Minor structural suggestions
+
+          If no issues found: ✅ No architectural issues found
+
+          RULES:
+          - Focus on STRUCTURAL impact, not implementation details.
+          - Consider backward compatibility of public APIs and contracts.
+          - Look for dependency direction violations (domain should not depend on infrastructure).
+          - Identify changes that break established project patterns.
+          - HIGH CONFIDENCE ONLY — do not speculate about intent.
+          """
+
+          # ── Build PR Comment ───────────────────────────────────────
+          SECTIONS = {
+              "security":     {"emoji": "🔒", "title": "Security"},
+              "quality":      {"emoji": "🔍", "title": "Code Quality"},
+              "architecture": {"emoji": "🏗️", "title": "Architecture"},
+          }
+
+          def build_comment(results):
+              lines = ["<!-- ai-code-review-v2 -->"]
+              lines.append("## 🤖 AI Code Review\n")
+              lines.append(f"**Model:** `{MODEL}` · **Thinking:** {THINKING_LEVEL} · **Scope:** {REVIEW_SCOPE}\n")
+
+              first_with_issues = True
+              for name in ["security", "quality", "architecture"]:
+                  if name not in results:
+                      continue
+                  result = results[name]
+                  cfg = SECTIONS[name]
+                  counts = count_severity(result)
+                  total = sum(counts.values())
+
+                  # Summary label
+                  if total > 0:
+                      parts = [f"{v}{k}" for k, v in counts.items() if v > 0]
+                      label = f"{total} finding{'s' if total != 1 else ''} ({' '.join(parts)})"
+                  else:
+                      label = "✅ No issues"
+
+                  # First section with issues is open
+                  open_attr = ""
+                  if total > 0 and first_with_issues:
+                      open_attr = " open"
+                      first_with_issues = False
+
+                  lines.append(f"<details{open_attr}>")
+                  lines.append(f"<summary>{cfg['emoji']} {cfg['title']} — {label}</summary>\n")
+                  lines.append(result)
+                  lines.append("\n</details>\n")
+
+              lines.append("---")
+              lines.append("*AI Code Review v2 · Powered by Gemini*")
+              return "\n".join(lines)
+
+          # ── Main ───────────────────────────────────────────────────
+          def main():
+              # 1. Read and prepare diff
+              diff = read_file("diff_content.txt", MAX_DIFF_SIZE)
+              diff = mask_secrets(diff)
+
+              if not diff.strip():
+                  print("No code changes to review.")
+                  write_output("result", "NO_CHANGES")
+                  return
+
+              # 2. Read project context
+              rules = read_file(".github/REVIEW_RULES.md")
+              context = read_file("CLAUDE.md", 8000) or read_file("README.md", 5000)
+              file_tree = read_file("file_tree.txt", 3000)
+
+              # 3. Build pass prompts
+              passes = {}
+              if REVIEW_SCOPE in ("all", "security"):
+                  passes["security"] = security_prompt(diff, CHANGED_FILES, rules)
+              if REVIEW_SCOPE in ("all", "quality"):
+                  passes["quality"] = quality_prompt(diff, CHANGED_FILES, context)
+              if REVIEW_SCOPE in ("all", "architecture"):
+                  passes["architecture"] = architecture_prompt(diff, CHANGED_FILES, context, file_tree)
+
+              # 4. Run each pass
+              client = genai.Client(api_key=API_KEY)
+              results = {}
+              quota_exhausted = False
+
+              for name, prompt in passes.items():
+                  print(f"Running {name} review...")
+                  try:
+                      results[name] = call_gemini(client, prompt)
+                      print(f"  ✓ {name} complete")
+                  except Exception as e:
+                      err = str(e)
+                      if "RESOURCE_EXHAUSTED" in err or "limit: 0" in err:
+                          quota_exhausted = True
+                          results[name] = f"⚠️ Skipped — API quota exhausted"
+                          print(f"  ⚠ {name} skipped (quota)")
+                      else:
+                          results[name] = f"⚠️ Review failed: {type(e).__name__}"
+                          print(f"  ✗ {name} failed: {type(e).__name__}")
+
+              # 5. Handle full quota exhaustion (no pass succeeded)
+              if all("⚠️ Skipped — API quota" in r for r in results.values()):
+                  with open("review.md", "w") as f:
+                      f.write("<!-- ai-code-review-v2 -->\n")
+                      f.write("## ⚠️ AI Code Review — Quota Exceeded\n\n")
+                      f.write("The review could not be completed because the Gemini API quota has been exhausted.\n")
+                      f.write("The review will run again on the next commit or when the quota resets.\n\n")
+                      f.write("---\n*AI Code Review v2 · Powered by Gemini*")
+                  write_output("result", "QUOTA_EXHAUSTED")
+                  write_output("has_critical", "false")
+                  write_output("has_high", "false")
+                  return
+
+              # 6. Build PR comment
+              comment = build_comment(results)
+              with open("review.md", "w") as f:
+                  f.write(comment)
+
+              # 7. Detect severity across all passes
+              all_text = "\n".join(results.values())
+              write_output("result", "COMPLETED")
+              write_output("has_critical", str("🔴" in all_text).lower())
+              write_output("has_high", str("🟠" in all_text).lower())
+
+          try:
+              main()
+          except Exception as e:
+              print(f"Fatal error: {type(e).__name__}: {e}", file=sys.stderr)
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("result=ERROR\n")
+              sys.exit(1)
+          PYEOF
+
+      - name: Post PR Comment
+        if: steps.review.outputs.result == 'COMPLETED' || steps.review.outputs.result == 'QUOTA_EXHAUSTED'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const review = fs.readFileSync('review.md', 'utf8');
+            const marker = 'ai-code-review-v2';
+
+            // Resolve PR number
+            let prNumber = context.issue?.number;
+            if (!prNumber) {
+              const branch = context.ref.replace('refs/heads/', '');
+              const { data: prs } = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                head: `${context.repo.owner}:${branch}`,
+                state: 'open'
+              });
+              if (prs.length > 0) prNumber = prs[0].number;
+            }
+            if (!prNumber) {
+              console.log('No PR found');
+              return;
+            }
+
+            // Find existing comment by hidden marker
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: review
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body: review
+              });
+            }
+
+      - name: Fail on Critical Issues
+        if: inputs.fail_on_critical && steps.review.outputs.has_critical == 'true'
+        run: |
+          echo "::error::CRITICAL issues found — review must be addressed before merging."
+          exit 1
+
+      - name: Fail on High Issues
+        if: inputs.fail_on_high && steps.review.outputs.has_high == 'true'
+        run: |
+          echo "::error::HIGH severity issues found — review must be addressed before merging."
+          exit 1
+
+      - name: Warn on High Issues
+        if: steps.review.outputs.has_high == 'true' && !inputs.fail_on_high
+        run: |
+          echo "::warning::HIGH severity issues detected. Please review the comments."

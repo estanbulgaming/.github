@@ -334,7 +334,7 @@ jobs:
                   return
 
               # 2. Read project context
-              rules = read_file(".github/REVIEW_RULES.md")
+              rules = read_file(".github/REVIEW_RULES.md") or read_file(".github/SECURITY_RULES.md")
               context = read_file("CLAUDE.md", 8000) or read_file("README.md", 5000)
               file_tree = read_file("file_tree.txt", 3000)
 

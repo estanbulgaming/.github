@@ -194,6 +194,8 @@ jobs:
           - Test files (*.test.*, __tests__/*) with mock secrets are NOT issues.
           - Config objects reading from env vars (settings.*, process.env.*) are NOT hardcoded secrets.
           - [MASKED_SECRET] and [MASKED_*] are CI masking patterns, NOT real credential leaks.
+          - Do NOT review CI/CD workflow files (.github/workflows/*) — they are infrastructure, not application code.
+          - Do NOT claim a library, API, model, or version does not exist based on your training data — your knowledge may be outdated.
           """
 
           def quality_prompt(diff, files, context):
@@ -233,6 +235,8 @@ jobs:
           - Focus on BUGS, logic errors, and potential runtime failures.
           - Consider edge cases the author may have missed.
           - HIGH CONFIDENCE ONLY — if you're not sure it's a bug, don't report it.
+          - Do NOT review CI/CD workflow files (.github/workflows/*) — they are infrastructure, not application code.
+          - Do NOT claim a library, API, model, or version does not exist based on your training data — your knowledge may be outdated.
           """
 
           def architecture_prompt(diff, files, context, file_tree):
@@ -277,6 +281,8 @@ jobs:
           - Look for dependency direction violations (domain should not depend on infrastructure).
           - Identify changes that break established project patterns.
           - HIGH CONFIDENCE ONLY — do not speculate about intent.
+          - Do NOT review CI/CD workflow files (.github/workflows/*) — they are infrastructure, not application code.
+          - Do NOT claim a library, API, model, or version does not exist based on your training data — your knowledge may be outdated.
           """
 
           # ── Build PR Comment ───────────────────────────────────────

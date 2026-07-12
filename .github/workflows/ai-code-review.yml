@@ -306,16 +306,19 @@ jobs:
                   counts = count_severity(result)
                   total = sum(counts.values())
 
-                  # Summary label
+                  # Summary label — a failed/skipped pass must not masquerade as "No issues"
+                  failed = result.lstrip().startswith("⚠️")
                   if total > 0:
                       parts = [f"{v}{k}" for k, v in counts.items() if v > 0]
                       label = f"{total} finding{'s' if total != 1 else ''} ({' '.join(parts)})"
+                  elif failed:
+                      label = "⚠️ Review failed"
                   else:
                       label = "✅ No issues"
 
-                  # First section with issues is open
+                  # First section with issues (or a failure) is open
                   open_attr = ""
-                  if total > 0 and first_with_issues:
+                  if (total > 0 or failed) and first_with_issues:
                       open_attr = " open"
                       first_with_issues = False
 
@@ -370,8 +373,11 @@ jobs:
                           results[name] = f"⚠️ Skipped — API quota exhausted"
                           print(f"  ⚠ {name} skipped (quota)")
                       else:
-                          results[name] = f"⚠️ Review failed: {type(e).__name__}"
-                          print(f"  ✗ {name} failed: {type(e).__name__}")
+                          # Include the (masked, truncated) message — bare type names hid a
+                          # stale-API-key failure for months
+                          detail = mask_secrets(err)[:300]
+                          results[name] = f"⚠️ Review failed: {type(e).__name__}: {detail}"
+                          print(f"  ✗ {name} failed: {type(e).__name__}: {detail}")
 
               # 5. Handle full quota exhaustion (no pass succeeded)
               if all("⚠️ Skipped — API quota" in r for r in results.values()):

@@ -137,6 +137,19 @@ jobs:
                               )
                           ),
                       )
+                      # response.text yanıtta metin parçası yoksa None döner (safety
+                      # block / yalnız-düşünce çıktısı / kesik yanıt). None'ı yukarı
+                      # sızdırmak "in r" kontrollerini TypeError ile düşürüyordu
+                      # (estanbul-dashboard#634, deterministik). RuntimeError mevcut
+                      # per-pass "⚠️ Review failed" yoluna akar; finish_reason teşhis
+                      # için mesajda taşınır.
+                      if response.text is None:
+                          finish = "unknown"
+                          try:
+                              finish = str(response.candidates[0].finish_reason)
+                          except Exception:
+                              pass
+                          raise RuntimeError(f"empty model response (finish_reason={finish})")
                       return response.text
                   except Exception as e:
                       err = str(e)
